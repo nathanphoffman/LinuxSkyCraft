@@ -257,6 +257,12 @@ namespace skycraft::Launcher
 
 	void StartMinecraft()
 	{
+		// Under Wine/Proton Minecraft runs natively on Linux, outside this prefix: nothing here can
+		// start it (tools/linux/skycraft-minecraft.sh does, as a Steam launch option).
+		if (const auto ntdll = ::GetModuleHandleW(L"ntdll.dll"); ntdll && ::GetProcAddress(ntdll, "wine_get_version")) {
+			logger::info("Minecraft: running under Wine/Proton; start the native Linux Minecraft with tools/linux/skycraft-minecraft.sh");
+			return;
+		}
 		CSimpleIniA ini;
 		ini.SetUnicode();
 		const bool haveIni = ini.LoadFile("Data/SKSE/Plugins/SkyCraft.ini") >= 0;

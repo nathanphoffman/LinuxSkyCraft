@@ -1,5 +1,6 @@
 #include "Link.h"
 
+#include <SimpleIni.h>
 #include <sddl.h>
 
 namespace skycraft
@@ -26,6 +27,24 @@ namespace skycraft
 			::CloseHandle(token);
 			return ok && elevation.TokenIsElevated;
 		}
+
+		bool RunningUnderWine()
+		{
+			const auto ntdll = ::GetModuleHandleW(L"ntdll.dll");
+			return ntdll && ::GetProcAddress(ntdll, "wine_get_version") != nullptr;
+		}
+
+		// Where the block lives under Wine; SkyCraft.ini's sLinkFile (a Windows-style path, Z: is the Linux root) overrides it.
+		std::wstring LinkFilePath()
+		{
+			CSimpleIniA ini;
+			ini.SetUnicode();
+			ini.LoadFile("Data/SKSE/Plugins/SkyCraft.ini");
+			const std::string chosen = ini.GetValue("Minecraft", "sLinkFile", "");
+			return chosen.empty() ? std::wstring(L"Z:\\dev\\shm\\skycraft_v1") : std::wstring(chosen.begin(), chosen.end());
+		}
+
+		std::string Narrow(const std::wstring& a_text) { return std::string(a_text.begin(), a_text.end()); }
 
 		// Who may open the shared memory: this Windows user (and the system and administrators), at
 		// normal integrity. Said explicitly because a Skyrim run as administrator would otherwise
@@ -74,9 +93,24 @@ namespace skycraft
 			logger::info("Skyrim is running as administrator");
 		}
 		SECURITY_ATTRIBUTES access{ sizeof(access), SharedWithThisUser(), FALSE };
-		mapping_ = ::CreateFileMappingW(INVALID_HANDLE_VALUE, access.lpSecurityDescriptor ? &access : nullptr, PAGE_READWRITE,
-			static_cast<DWORD>(size >> 32), static_cast<DWORD>(size & 0xFFFFFFFF), proto::kMappingName);
-		const DWORD created = ::GetLastError();
+		// Under Wine/Proton a named mapping can't be seen by a native Linux Minecraft, so the block
+		// lives in a file on the Linux side instead (/dev/shm, seen from here as Z:\dev\shm): Minecraft
+		// mmaps the same file. Never truncated: a Minecraft that still has it mapped would crash.
+		HANDLE linkFile = INVALID_HANDLE_VALUE;
+		if (RunningUnderWine()) {
+			linkFile = ::CreateFileW(LinkFilePath().c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (linkFile == INVALID_HANDLE_VALUE) {
+				logger::warn("shared memory: couldn't open {} ({}); falling back to a named mapping (only a Minecraft inside Wine can see it)", Narrow(LinkFilePath()), ::GetLastError());
+			}
+		}
+		const bool fileBacked = linkFile != INVALID_HANDLE_VALUE;
+		const DWORD fileExisted = fileBacked ? ::GetLastError() : 0;
+		mapping_ = ::CreateFileMappingW(fileBacked ? linkFile : INVALID_HANDLE_VALUE, fileBacked || !access.lpSecurityDescriptor ? nullptr : &access, PAGE_READWRITE,
+			static_cast<DWORD>(size >> 32), static_cast<DWORD>(size & 0xFFFFFFFF), fileBacked ? nullptr : proto::kMappingName);
+		const DWORD created = fileBacked ? fileExisted : ::GetLastError();
+		if (fileBacked) {
+			::CloseHandle(linkFile);  // the mapping keeps the file open
+		}
 		if (access.lpSecurityDescriptor) {
 			::LocalFree(access.lpSecurityDescriptor);
 		}
@@ -109,7 +143,7 @@ namespace skycraft
 		header->skyrimHeartbeatMs = ::GetTickCount64();
 		Atomic(header->magic).store(proto::kMagic, std::memory_order_release);
 
-		logger::info("shared memory {} ({} MB, {})", "Local\\SkyCraft_v1", size >> 20, existed ? "reused" : "created");
+		logger::info("shared memory {} ({} MB, {})", fileBacked ? Narrow(LinkFilePath()) : "Local\\SkyCraft_v1", size >> 20, existed ? "reused" : "created");
 		return true;
 	}
 
@@ -118,9 +152,16 @@ namespace skycraft
 		if (!base_) {
 			return false;
 		}
+		// Minecraft's heartbeat is on its own clock when it runs natively under Linux, so only watch
+		// it change and time that on ours.
 		auto& beat = At<proto::Header>(proto::kOffHeader)->mcHeartbeatMs;
 		const auto last = Atomic(beat).load(std::memory_order_acquire);
-		return last != 0 && ::GetTickCount64() - last < kMcTimeoutMs;
+		const auto now = ::GetTickCount64();
+		if (last != lastMcBeat_) {
+			lastMcBeat_ = last;
+			lastMcBeatAt_ = now;
+		}
+		return last != 0 && now - lastMcBeatAt_ < kMcTimeoutMs;
 	}
 
 	std::uint32_t Link::McPid() const

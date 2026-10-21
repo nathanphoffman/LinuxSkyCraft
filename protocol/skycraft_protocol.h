@@ -48,8 +48,8 @@ namespace skycraft::proto
 		std::uint32_t version;
 		std::uint32_t skyrimPid;
 		std::uint32_t mcPid;
-		std::uint64_t skyrimHeartbeatMs;  // GetTickCount64() at last Skyrim frame
-		std::uint64_t mcHeartbeatMs;      // GetTickCount64() at last MC frame
+		std::uint64_t skyrimHeartbeatMs;  // changes every Skyrim frame (GetTickCount64()); only ever watched for change
+		std::uint64_t mcHeartbeatMs;      // changes every MC frame (its own ms clock); only ever watched for change
 	};
 	static_assert(sizeof(Header) == 0x20);
 

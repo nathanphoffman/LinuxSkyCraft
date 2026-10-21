@@ -57,6 +57,8 @@ namespace skycraft
 		HANDLE        mapping_{ nullptr };
 		std::uint8_t* base_{ nullptr };
 		std::uint32_t overlayFront_{ 2 };
+		mutable std::uint64_t lastMcBeat_{ 0 };
+		mutable std::uint64_t lastMcBeatAt_{ 0 };
 	};
 
 	// ---- coordinate conversion (Skyrim units <-> Minecraft blocks) ----------------------------

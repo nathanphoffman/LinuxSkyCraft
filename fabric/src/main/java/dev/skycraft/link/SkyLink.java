@@ -11,7 +11,11 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
+import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
 /**
  * The Minecraft end of the shared-memory link. Skyrim owns the mapping; we open it when it
@@ -40,20 +44,40 @@ public final class SkyLink {
 	private static MemorySegment runningMutex;
 	private static final MemorySegment QPC_OUT = Arena.global().allocate(JAVA_LONG);
 
+	/**
+	 * Off Windows (Minecraft native on Linux, Skyrim under Proton) the link is a plain file both sides
+	 * map: Skyrim sees it as Z:\dev\shm\skycraft_v1, we map /dev/shm/skycraft_v1. Wine's named
+	 * mappings can't be opened from a native process, so a file stands in for the named mapping.
+	 */
+	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().startsWith("windows");
+	private static final Path LINK_FILE = Path.of(System.getProperty("skycraft.linkFile", "/dev/shm/skycraft_v1"));
+	/** QueryPerformanceCounter under Wine/Proton ticks at 10 MHz off CLOCK_MONOTONIC, as System.nanoTime() does on Linux. */
+	private static final long LINUX_QPC_FREQUENCY = 10_000_000L;
+
 	static {
-		Linker linker = Linker.nativeLinker();
-		SymbolLookup k32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
-		OPEN_FILE_MAPPING = linker.downcallHandle(
-			k32.find("OpenFileMappingW").orElseThrow(), FunctionDescriptor.of(ADDRESS, JAVA_INT, JAVA_INT, ADDRESS), Linker.Option.captureCallState("GetLastError")
-		);
-		MAP_VIEW_OF_FILE = linker.downcallHandle(
-			k32.find("MapViewOfFile").orElseThrow(), FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG)
-		);
-		GET_TICK_COUNT64 = linker.downcallHandle(k32.find("GetTickCount64").orElseThrow(), FunctionDescriptor.of(JAVA_LONG));
-		GET_CURRENT_PROCESS_ID = linker.downcallHandle(k32.find("GetCurrentProcessId").orElseThrow(), FunctionDescriptor.of(JAVA_INT));
-		QUERY_PERFORMANCE_COUNTER = linker.downcallHandle(k32.find("QueryPerformanceCounter").orElseThrow(), FunctionDescriptor.of(JAVA_INT, ADDRESS));
-		QUERY_PERFORMANCE_FREQUENCY = linker.downcallHandle(k32.find("QueryPerformanceFrequency").orElseThrow(), FunctionDescriptor.of(JAVA_INT, ADDRESS));
-		CREATE_MUTEX = linker.downcallHandle(k32.find("CreateMutexW").orElseThrow(), FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+		if (WINDOWS) {
+			Linker linker = Linker.nativeLinker();
+			SymbolLookup k32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
+			OPEN_FILE_MAPPING = linker.downcallHandle(
+				k32.find("OpenFileMappingW").orElseThrow(), FunctionDescriptor.of(ADDRESS, JAVA_INT, JAVA_INT, ADDRESS), Linker.Option.captureCallState("GetLastError")
+			);
+			MAP_VIEW_OF_FILE = linker.downcallHandle(
+				k32.find("MapViewOfFile").orElseThrow(), FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG)
+			);
+			GET_TICK_COUNT64 = linker.downcallHandle(k32.find("GetTickCount64").orElseThrow(), FunctionDescriptor.of(JAVA_LONG));
+			GET_CURRENT_PROCESS_ID = linker.downcallHandle(k32.find("GetCurrentProcessId").orElseThrow(), FunctionDescriptor.of(JAVA_INT));
+			QUERY_PERFORMANCE_COUNTER = linker.downcallHandle(k32.find("QueryPerformanceCounter").orElseThrow(), FunctionDescriptor.of(JAVA_INT, ADDRESS));
+			QUERY_PERFORMANCE_FREQUENCY = linker.downcallHandle(k32.find("QueryPerformanceFrequency").orElseThrow(), FunctionDescriptor.of(JAVA_INT, ADDRESS));
+			CREATE_MUTEX = linker.downcallHandle(k32.find("CreateMutexW").orElseThrow(), FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+		} else {
+			OPEN_FILE_MAPPING = null;
+			MAP_VIEW_OF_FILE = null;
+			GET_TICK_COUNT64 = null;
+			GET_CURRENT_PROCESS_ID = null;
+			QUERY_PERFORMANCE_COUNTER = null;
+			QUERY_PERFORMANCE_FREQUENCY = null;
+			CREATE_MUTEX = null;
+		}
 	}
 
 	/**
@@ -61,7 +85,7 @@ public final class SkyLink {
 	 * SKSE plugin knows not to start another one (even before the two have linked up).
 	 */
 	public static synchronized void announceRunning() {
-		if (runningMutex != null) {
+		if (!WINDOWS || runningMutex != null) {
 			return;
 		}
 		try (Arena arena = Arena.ofConfined()) {
@@ -76,6 +100,8 @@ public final class SkyLink {
 	private static long lastOpenAttempt;
 	private static int skyrimPid;
 	private static volatile int generation;
+	private static volatile long lastSkyrimBeat;
+	private static volatile long lastSkyrimBeatAt;
 
 	private SkyLink() {
 	}
@@ -86,8 +112,14 @@ public final class SkyLink {
 		if (s == null) {
 			return false;
 		}
+		// Skyrim's heartbeat is on its own clock (Wine's GetTickCount64 isn't ours), so only watch it change.
 		long beat = (long) LONG.getAcquire(s, OFF_HEADER + H_SKYRIM_HEARTBEAT);
-		return tickCount() - beat < HEARTBEAT_TIMEOUT_MS;
+		long now = tickCount();
+		if (beat != lastSkyrimBeat) {
+			lastSkyrimBeat = beat;
+			lastSkyrimBeatAt = now;
+		}
+		return now - lastSkyrimBeatAt < HEARTBEAT_TIMEOUT_MS;
 	}
 
 	/** Bumps whenever a (new) Skyrim instance is on the other end: everything Skyrim caches must be resent. */
@@ -124,6 +156,10 @@ public final class SkyLink {
 			return;
 		}
 		lastOpenAttempt = now;
+		if (!WINDOWS) {
+			openLinkFile();
+			return;
+		}
 		try (Arena arena = Arena.ofConfined()) {
 			MemorySegment name = arena.allocateFrom(MAPPING_NAME, StandardCharsets.UTF_16LE);
 			MemorySegment handle = (MemorySegment) OPEN_FILE_MAPPING.invokeExact(OPEN_STATE, FILE_MAP_ALL_ACCESS, 0, name);
@@ -161,8 +197,55 @@ public final class SkyLink {
 		}
 	}
 
+	/** Linux: maps the file Skyrim's plugin created (never truncates it, so an old mapping stays valid). */
+	private static void openLinkFile() {
+		try {
+			if (!java.nio.file.Files.exists(LINK_FILE)) {
+				logOpenFailure("Skyrim hasn't created " + LINK_FILE + " yet");
+				return;
+			}
+			FileChannel channel = FileChannel.open(LINK_FILE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+			if (channel.size() < MAPPING_BYTES) {
+				channel.close();
+				logOpenFailure(LINK_FILE + " is smaller than the link (" + MAPPING_BYTES + " bytes); Skyrim is still setting it up");
+				return;
+			}
+			MemorySegment seg = channel.map(FileChannel.MapMode.READ_WRITE, 0, MAPPING_BYTES, Arena.global());
+			channel.close();
+			int magic = seg.get(JAVA_INT, OFF_HEADER + H_MAGIC);
+			int version = seg.get(JAVA_INT, OFF_HEADER + H_VERSION);
+			if (magic != MAGIC || version != VERSION) {
+				// Skyrim hasn't filled in the header yet (or an old file is left over): try again next second.
+				logOpenFailure("protocol mismatch (magic " + Integer.toHexString(magic) + " version " + version + "); expected version " + VERSION);
+				return;
+			}
+			seg.set(JAVA_INT, OFF_HEADER + H_MC_PID, (int) ProcessHandle.current().pid());
+			LONG.setRelease(seg, OFF_HEADER + H_MC_HEARTBEAT, tickCount());
+			skyrimPid = seg.get(JAVA_INT, OFF_HEADER + H_SKYRIM_PID);
+			lastSkyrimBeat = (long) LONG.getAcquire(seg, OFF_HEADER + H_SKYRIM_HEARTBEAT);
+			lastSkyrimBeatAt = tickCount();
+			generation++;
+			shm = seg;
+			SkyCraft.LOG.info("SkyCraft: linked to Skyrim through {} (pid {})", LINK_FILE, skyrimPid);
+		} catch (IOException | RuntimeException e) {
+			SkyCraft.LOG.error("SkyCraft: failed to open the link file " + LINK_FILE, e);
+		}
+	}
+
+	private static String lastOpenFailure = "";
+
+	private static void logOpenFailure(String why) {
+		if (!why.equals(lastOpenFailure)) {
+			lastOpenFailure = why;
+			SkyCraft.LOG.info("SkyCraft: can't open Skyrim's shared memory yet: {}", why);
+		}
+	}
+
 	/** QueryPerformanceCounter: the same clock Skyrim reads, so tick timestamps line up across processes. */
 	public static synchronized long qpc() {
+		if (!WINDOWS) {
+			return System.nanoTime() / 100;
+		}
 		try {
 			int ok = (int) QUERY_PERFORMANCE_COUNTER.invokeExact(QPC_OUT);
 			return QPC_OUT.get(JAVA_LONG, 0);
@@ -173,6 +256,9 @@ public final class SkyLink {
 
 	/** Ticks per second of {@link #qpc()}. */
 	public static synchronized long qpcFrequency() {
+		if (!WINDOWS) {
+			return LINUX_QPC_FREQUENCY;
+		}
 		try {
 			int ok = (int) QUERY_PERFORMANCE_FREQUENCY.invokeExact(QPC_OUT);
 			return QPC_OUT.get(JAVA_LONG, 0);
@@ -182,6 +268,9 @@ public final class SkyLink {
 	}
 
 	public static long tickCount() {
+		if (!WINDOWS) {
+			return System.nanoTime() / 1_000_000;
+		}
 		try {
 			return (long) GET_TICK_COUNT64.invokeExact();
 		} catch (Throwable t) {

@@ -14,6 +14,30 @@ shared memory. Minecraft runs hidden in the background, and Skyrim draws everyth
 > This is a fan project. It isn't affiliated with Mojang, Microsoft, Bethesda or ZeniMax, and you
 > need to own both games.
 
+## About this fork (Linux)
+
+This is a fork of [chasmlol/SkyCraft](https://github.com/chasmlol/SkyCraft) that aims to run on
+Linux, with **Skyrim under Steam Proton** and **Minecraft Java Edition running natively**. All the
+game work is the original author's (MIT license, see below). This fork only changes how the two
+halves connect.
+
+> **Status: untested.** The changes are written but haven't been built or run yet.
+
+What's different from upstream:
+
+- **Link file instead of a named mapping.** Wine's shared memory can't be seen by a native Linux
+  program, so under Proton the plugin puts the shared block in `Z:\dev\shm\skycraft_v1`, and
+  Minecraft maps `/dev/shm/skycraft_v1`. On Windows nothing changes.
+- **Clocks and heartbeats** no longer assume both programs share one Windows clock.
+- **Minecraft is started by a script,** not by the plugin:
+  `tools/linux/skycraft-minecraft.sh` (use it as Skyrim's Steam launch option:
+  `/path/to/tools/linux/skycraft-minecraft.sh %command%`).
+- New `sLinkFile` setting in `SkyCraft.ini` (optional).
+
+Still needed: the SKSE plugin is a Windows DLL, so it has to be built with a Windows toolchain (or
+a clang-cl cross-build). Skyrim itself stays under Proton. Everything below is the upstream
+README, written for Windows.
+
 ## What works
 
 - **Movement:** Minecraft movement on Skyrim's terrain and buildings. That covers walking,

@@ -18,3 +18,13 @@ CMakeUserPresets.json
 fabric/run-guest*/
 __pycache__/
 *.pyc
+# logs, build output, downloaded jars
+*.log
+*.jar
+!fabric/gradle/wrapper/gradle-wrapper.jar
+.gradle/
+build/
+# local notes and editor files
+.claude/
+*.swp
+.DS_Store
